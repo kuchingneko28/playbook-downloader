@@ -12,7 +12,7 @@ describe("crypto utility", () => {
       // Map to groups (1 -> abcd3, 0 -> abcd2)
       const bitfieldString = totalBits
         .split("")
-        .map((b) => (b === "1" ? "abcd3" : "abcd2"))
+        .map((bit) => (bit === "1" ? "abcd3" : "abcd2"))
         .join("");
 
       const key = decipherKey(bitfieldString);

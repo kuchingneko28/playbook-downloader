@@ -3,9 +3,10 @@ import path from "path";
 import { BaseDownloader, DownloaderOptions } from "./base";
 import { decryptSegment, decryptPage } from "../utils/crypto";
 import { buildEpub, Chapter, Cover, EpubImage } from "../utils/epub-builder";
-import { logger } from "../utils/logger";
+import { logger, withSpinner } from "../utils/logger";
 import { GoogleBookSegment } from "../types";
-import { safeName, delay } from "../utils/helpers";
+import { safeName, escapeRegex } from "../utils/text";
+import { delay, fetchWithRetry, concurrentMap } from "../utils/async";
 
 export class EpubDownloader extends BaseDownloader {
   private epubImages: EpubImage[] = [];
@@ -29,14 +30,18 @@ export class EpubDownloader extends BaseDownloader {
 
     let resultHtml = html;
     let imageCounter = 1;
+    const urlToFilename = new Map<string, string>();
 
-    for (const url of urls) {
+    // Sort URLs by length descending to avoid substring collisions during replacement
+    const sortedUrls = [...urls].sort((a, b) => b.length - a.length);
+
+    for (const url of sortedUrls) {
       try {
         logger.debug(`Downloading inline image: ${url}`);
 
         // Fix XML-escaped ampersands inside URL query parameters (e.g. &amp; -> &)
         const cleanUrl = url.replace(/&amp;/g, "&");
-        const response = await fetch(cleanUrl, { headers: this.headers });
+        const response = await fetchWithRetry(cleanUrl, { headers: this.headers });
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
@@ -63,14 +68,24 @@ export class EpubDownloader extends BaseDownloader {
           mimeType: contentType,
         });
 
-        // Replace absolute URL in HTML with relative image path
-        resultHtml = resultHtml.split(url).join(filename);
+        urlToFilename.set(url, filename);
 
         logger.debug(`Saved image inside EPUB memory under: ${filename}`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.logWarn(`Failed to download image ${url}: ${msg}`);
       }
+    }
+
+    // Single-pass replacement to avoid substring corruption
+    if (urlToFilename.size > 0) {
+      const urlPatterns = [...urlToFilename.keys()]
+        .map((url) => escapeRegex(url))
+        .join("|");
+      resultHtml = resultHtml.replace(
+        new RegExp(`(["'])(${urlPatterns})\\1`, "g"),
+        (_, quote, url) => quote + urlToFilename.get(url) + quote,
+      );
     }
 
     return resultHtml;
@@ -101,7 +116,7 @@ export class EpubDownloader extends BaseDownloader {
     try {
       const coverUrl = `https://books.google.com/books/content?id=${this.bookId}&printsec=frontcover&img=1&zoom=3`;
       logger.info("Downloading book cover image...");
-      const response = await fetch(coverUrl, { headers: this.headers });
+      const response = await fetchWithRetry(coverUrl, { headers: this.headers });
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
@@ -133,24 +148,24 @@ export class EpubDownloader extends BaseDownloader {
       return resultHtml;
     }
 
-    for (const p of segmentObj.page) {
-      if (p.src) {
+    for (const page of segmentObj.page) {
+      if (page.src) {
         try {
-          logger.debug(`Downloading segment page image: ${p.pid}`);
-          const pageUrl = new URL(p.src);
+          logger.debug(`Downloading segment page image: ${page.pid}`);
+          const pageUrl = new URL(page.src);
           pageUrl.searchParams.set("w", "10000");
           pageUrl.searchParams.set("h", "10000");
           pageUrl.searchParams.set("zoom", "3");
           pageUrl.searchParams.set("enc_all", "1");
           pageUrl.searchParams.set("img", "1");
 
-          const response = await fetch(pageUrl.toString(), { headers: this.headers });
+          const response = await fetchWithRetry(pageUrl.toString(), { headers: this.headers });
           if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
           }
           const contentType = response.headers.get("content-type") || "image/jpeg";
           const ext = contentType.includes("png") ? "png" : "jpeg";
-          const filename = `images/${p.pid}.${ext}`;
+          const filename = `images/${page.pid}.${ext}`;
 
           const arrayBuffer = await response.arrayBuffer();
           const decryptedImage = decryptPage(Buffer.from(arrayBuffer), aesKey);
@@ -172,7 +187,7 @@ export class EpubDownloader extends BaseDownloader {
           }
         } catch (imgErr) {
           const msg = imgErr instanceof Error ? imgErr.message : String(imgErr);
-          logger.warn(`Failed to download page image ${p.pid} for segment ${label}: ${msg}`);
+          logger.warn(`Failed to download page image ${page.pid} for segment ${label}: ${msg}`);
         }
       }
     }
@@ -207,7 +222,7 @@ export class EpubDownloader extends BaseDownloader {
 
     try {
       logger.debug(`Downloading segment ${label} from: ${urlObj.toString()}`);
-      const response = await fetch(urlObj.toString(), {
+      const response = await fetchWithRetry(urlObj.toString(), {
         headers: this.headers,
       });
       if (!response.ok) {
@@ -265,25 +280,27 @@ export class EpubDownloader extends BaseDownloader {
    * Core download runner for EPUB.
    */
   async run(): Promise<void> {
-    logger.info("Fetching book details...");
-    const html = await this.getBookHtml();
+    const { html, manifest } = await withSpinner("Fetching book details...", async () => {
+      const htmlText = await this.getBookHtml();
+      const manifestData = await this.getManifest();
+      return { html: htmlText, manifest: manifestData };
+    });
     const aesKey = this.getKey(html);
-    const manifest = await this.getManifest();
-    const metadata = manifest.metadata;
+    const metadata = manifest.metadata || {};
 
     if (!manifest.segment || manifest.segment.length === 0) {
       throw new Error("This book does not contain reflowable text segments (EPUB format is unavailable). Try downloading as PDF.");
     }
 
     if (metadata.preview && metadata.preview !== "full") {
-      throw new Error(`The book is in preview mode ('${metadata.preview}'). Please refresh or update your cookies in cookies.txt to download the full book.`);
+      logger.warn(`The book metadata indicates preview mode ('${metadata.preview}'). Downloading available text segments...`);
     }
 
-    const missingSegments = manifest.segment.filter((s) => !s.link);
+    const missingSegments = manifest.segment.filter((segment) => !segment.link);
     if (missingSegments.length > 0) {
       const pct = ((missingSegments.length / manifest.segment.length) * 100).toFixed(2);
       const listStr = logger.showDebug
-        ? ` List of missing segments: [${missingSegments.map(s => s.label).join(", ")}].`
+        ? ` List of missing segments: [${missingSegments.map(segment => segment.label).join(", ")}].`
         : "";
       logger.warn(`Could not find a download link for ${missingSegments.length} text segments (${pct}% missing, total: ${manifest.segment.length}).${listStr} You might need to update your cookies.`);
     }
@@ -291,7 +308,9 @@ export class EpubDownloader extends BaseDownloader {
     const title = metadata.title || metadata.volume_title || "Untitled";
     const safeTitle = safeName(title);
     const epubFilename = `${safeTitle}.epub`;
-    const outputPath = path.join(this.options.outputDir, epubFilename);
+
+    this.prepareOutputDir(safeTitle);
+    const outputPath = path.join(this.bookOutputDir, epubFilename);
 
     if (fs.existsSync(outputPath)) {
       logger.success(`Book already exists in downloads: ${outputPath}`);
@@ -317,19 +336,38 @@ export class EpubDownloader extends BaseDownloader {
     // Try downloading the cover
     const cover = await this.downloadCover();
 
-    logger.step(`Downloading and decrypting ${segments.length} text segments...`);
+    const validSegments = segments.filter((segment) => segment.link);
+    if (validSegments.length === 0) {
+      throw new Error("No accessible text segments with download links found. Please check your account ownership and cookies.");
+    }
+
+    logger.step(`Downloading and decrypting ${validSegments.length} text segments...`);
+    const concurrency = this.options.concurrency || 1;
 
     const chapters: Chapter[] = [];
+    let completedCount = 0;
 
-    for (let i = 0; i < segments.length; i++) {
-      const chapter = await this.downloadAndProcessSegment(segments[i], aesKey, i, segments.length);
-      if (chapter) {
-        chapters.push(chapter);
-      }
+    const results = await concurrentMap(
+      validSegments,
+      concurrency,
+      async (segment, idx) => {
+        const chapter = await this.downloadAndProcessSegment(segment, aesKey, idx, validSegments.length);
+        completedCount++;
+        if (chapter) {
+          const displayTitle = chapter.title && chapter.title !== "Untitled" ? ` (${chapter.title})` : "";
+          logger.progress(completedCount, validSegments.length, `Saved segment ${chapter.label}${displayTitle}`);
+        }
 
-      if (this.options.pace > 0 && i < segments.length - 1) {
-        await delay(this.options.pace);
-      }
+        if (concurrency <= 1 && this.options.pace > 0 && completedCount < validSegments.length) {
+          await delay(this.options.pace);
+        }
+
+        return chapter;
+      },
+    );
+
+    for (const chapter of results) {
+      if (chapter) chapters.push(chapter);
     }
     logger.clearProgress();
 
@@ -340,7 +378,7 @@ export class EpubDownloader extends BaseDownloader {
       authors: Array.isArray(authors)
         ? authors
         : typeof authors === "string"
-        ? authors.split(",").map((a: string) => a.trim())
+        ? authors.split(",").map((author: string) => author.trim())
         : ["Unknown Author"],
       publisher: publisher || "Unknown Publisher",
       pubDate: pub_date || new Date().getFullYear().toString(),
@@ -352,17 +390,7 @@ export class EpubDownloader extends BaseDownloader {
 
     logger.success(`EPUB saved successfully: ${outputPath}`);
 
-    // Cleanup temporary directory
-    try {
-      logger.info("Cleaning up temporary files...");
-      if (fs.existsSync(this.bookTempDir)) {
-        fs.rmSync(this.bookTempDir, { recursive: true, force: true });
-      }
-      if (fs.existsSync(this.options.tempDir) && fs.readdirSync(this.options.tempDir).length === 0) {
-        fs.rmSync(this.options.tempDir, { recursive: true, force: true });
-      }
-    } catch (err) {
-      // Ignore cleanup error
-    }
+    this.saveMetadata(metadata, title);
+    this.cleanup();
   }
 }

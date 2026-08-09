@@ -5,7 +5,8 @@ import { EpubDownloader } from './downloader/epub';
 import { PdfDownloader } from './downloader/pdf';
 import { GoogleBookManifest } from './types';
 import { getCookieHeader } from './utils/cookie';
-import { logger } from './utils/logger';
+import { fetchWithRetry } from './utils/async';
+import { logger, intro, outro, withSpinner } from './utils/logger';
 
 interface CliOptions {
   format: 'pdf' | 'epub' | 'auto';
@@ -13,7 +14,9 @@ interface CliOptions {
   output: string;
   temp: string;
   pace: string;
+  concurrency: string;
   verbose: boolean;
+  metadataOnly: boolean;
 }
 
 /**
@@ -31,12 +34,12 @@ async function detectFormat(
   };
   const url = `https://play.google.com/books/volumes/${bookId}/manifest?hl=en&source=ge-web-app`;
 
-  const res = await fetch(url, { headers });
-  if (!res.ok) {
-    throw new Error(`Failed to fetch book manifest: ${res.statusText} (${res.status})`);
+  const response = await fetchWithRetry(url, { headers });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch book manifest: ${response.statusText} (${response.status})`);
   }
 
-  const manifest = (await res.json()) as GoogleBookManifest;
+  const manifest = (await response.json()) as GoogleBookManifest;
   if (manifest.segment && manifest.segment.length > 0) {
     return { format: 'epub', manifest };
   }
@@ -46,7 +49,18 @@ async function detectFormat(
   throw new Error('No readable segments or pages found in book manifest.');
 }
 
-async function main() {
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  logger.error(`Unhandled Rejection: ${msg}`);
+  process.exit(1);
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error(`Uncaught Exception: ${error.message}`);
+  process.exit(1);
+});
+
+async function main(): Promise<void> {
   const cli = cac('playbook');
 
   cli
@@ -56,7 +70,9 @@ async function main() {
     .option('-o, --output <dir>', 'Directory to save downloaded books', { default: './downloads' })
     .option('-t, --temp <dir>', 'Directory for caching temporary files', { default: './temp' })
     .option('-p, --pace <ms>', 'Pacing delay in milliseconds between requests', { default: '300' })
+    .option('-n, --concurrency <n>', 'Number of concurrent downloads (1 = sequential)', { default: '1' })
     .option('-v, --verbose', 'Enable verbose output logging', { default: false })
+    .option('-m, --metadata-only', 'Save metadata and TOC JSON only without downloading book content', { default: false })
     .action(async (bookId: string | undefined, options: CliOptions) => {
       // If book-id is omitted, show the help menu
       if (!bookId) {
@@ -66,7 +82,7 @@ async function main() {
 
       logger.showDebug = options.verbose;
 
-      logger.step('Google Play Book Downloader');
+      intro('Google Play Book Downloader');
       logger.info(`Book ID: ${bookId}`);
 
       // Resolve options paths
@@ -74,6 +90,7 @@ async function main() {
       const outputDir = path.resolve(options.output);
       const tempDir = path.resolve(options.temp);
       const paceMs = parseInt(options.pace, 10);
+      const concurrency = parseInt(options.concurrency, 10);
 
       // Validate inputs
       if (!fs.existsSync(cookiesPath)) {
@@ -83,18 +100,43 @@ async function main() {
         process.exit(1);
       }
 
+      const cookieStat = fs.statSync(cookiesPath);
+      if (cookieStat.mode & 0o077) {
+        const mode = cookieStat.mode & 0o777;
+        logger.warn(
+          `Cookies file is readable by others (permissions: ${mode.toString(8)}). Consider restricting it with: chmod 600 ${cookiesPath}`
+        );
+      }
+
       if (isNaN(paceMs) || paceMs < 0) {
         logger.error('Pacing delay must be a positive number.');
         process.exit(1);
       }
+
+      if (isNaN(concurrency) || concurrency < 1) {
+        logger.error('Concurrency must be a positive number.');
+        process.exit(1);
+      }
+
+      // Register signal handlers for graceful temp cleanup
+      const bookTempPath = path.join(tempDir, bookId);
+      const cleanupOnSignal = () => {
+        if (fs.existsSync(bookTempPath)) {
+          fs.rmSync(bookTempPath, { recursive: true, force: true });
+        }
+        process.exit(0);
+      };
+      process.on('SIGINT', cleanupOnSignal);
+      process.on('SIGTERM', cleanupOnSignal);
 
       let chosenFormat: 'pdf' | 'epub' = 'pdf';
       let preFetchedManifest: GoogleBookManifest | undefined;
 
       try {
         if (options.format === 'auto') {
-          logger.info('Auto-detecting optimal format...');
-          const detected = await detectFormat(bookId, cookiesPath);
+          const detected = await withSpinner('Auto-detecting optimal format...', () =>
+            detectFormat(bookId, cookiesPath)
+          );
           chosenFormat = detected.format;
           preFetchedManifest = detected.manifest;
         } else if (options.format === 'pdf' || options.format === 'epub') {
@@ -109,10 +151,29 @@ async function main() {
           outputDir,
           tempDir,
           pace: paceMs,
+          concurrency,
           verbose: options.verbose,
           interactive: false,
           manifest: preFetchedManifest,
         };
+
+        if (options.metadataOnly) {
+          logger.info('Extracting metadata and Table of Contents only...');
+          const downloader = chosenFormat === 'pdf' ? new PdfDownloader(bookId, downloaderOptions) : new EpubDownloader(bookId, downloaderOptions);
+          const html = await downloader.getBookHtml();
+          const manifest = await downloader.getManifest();
+          const metadata = manifest.metadata || {};
+          const toc = downloader.getToc(html);
+          const title = metadata.title || metadata.volume_title || 'Untitled';
+          
+          downloader.prepareOutputDir(title);
+          downloader.saveMetadata(metadata, title);
+          if (toc.length > 0 && downloader instanceof PdfDownloader) {
+            downloader.saveToc(toc, title);
+          }
+          outro('Metadata extraction complete!');
+          return;
+        }
 
         if (chosenFormat === 'pdf') {
           const downloader = new PdfDownloader(bookId, downloaderOptions);
@@ -121,6 +182,7 @@ async function main() {
           const downloader = new EpubDownloader(bookId, downloaderOptions);
           await downloader.run();
         }
+        outro('Download completed successfully!');
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.error(`Execution Failed: ${msg}`);

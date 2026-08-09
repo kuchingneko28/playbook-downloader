@@ -2,14 +2,17 @@ import fs from "fs";
 import path from "path";
 import { getCookieHeader } from "../utils/cookie";
 import { decipherKey } from "../utils/crypto";
+import { fetchWithRetry } from "../utils/async";
+import { safeName } from "../utils/text";
 import { logger } from "../utils/logger";
-import { GoogleBookManifest, GoogleBookTocEntry } from "../types";
+import { GoogleBookManifest, GoogleBookMetadata, GoogleBookTocEntry } from "../types";
 
 export interface DownloaderOptions {
   cookiesPath: string;
   outputDir: string;
   tempDir: string;
   pace: number;
+  concurrency?: number;
   verbose?: boolean;
   interactive?: boolean;
   manifest?: GoogleBookManifest;
@@ -19,21 +22,24 @@ export abstract class BaseDownloader {
   protected bookId: string;
   protected options: DownloaderOptions;
   protected bookTempDir: string;
+  protected bookOutputDir: string;
   protected headers: Record<string, string>;
   protected cachedManifest?: GoogleBookManifest;
+  protected metadata?: GoogleBookMetadata;
 
   constructor(bookId: string, options: DownloaderOptions) {
     this.bookId = bookId;
     this.options = options;
     this.bookTempDir = path.join(this.options.tempDir, this.bookId);
-    
+    this.bookOutputDir = this.options.outputDir;
+
     if (options.manifest) {
       this.cachedManifest = options.manifest;
     }
 
     // Initialize directories
-    if (!fs.existsSync(this.options.outputDir)) {
-      fs.mkdirSync(this.options.outputDir, { recursive: true });
+    if (!fs.existsSync(this.bookOutputDir)) {
+      fs.mkdirSync(this.bookOutputDir, { recursive: true });
     }
     if (!fs.existsSync(this.options.tempDir)) {
       fs.mkdirSync(this.options.tempDir, { recursive: true });
@@ -52,24 +58,18 @@ export abstract class BaseDownloader {
     };
   }
 
-  /**
-   * Fetches the book reader HTML.
-   */
   async getBookHtml(): Promise<string> {
     const url = `https://play.google.com/books/reader?id=${this.bookId}&hl=en`;
     logger.debug(`Fetching book reader HTML from: ${url}`);
-    const res = await fetch(url, { headers: this.headers });
-    if (!res.ok) {
-      throw new Error(`Failed to fetch book reader HTML: ${res.statusText} (${res.status})`);
+    const response = await fetchWithRetry(url, { headers: this.headers });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch book reader HTML: ${response.statusText} (${response.status})`);
     }
-    const text = await res.text();
+    const text = await response.text();
     logger.debug(`Successfully fetched reader HTML (${text.length} characters)`);
     return text;
   }
 
-  /**
-   * Fetches the book manifest.
-   */
   async getManifest(): Promise<GoogleBookManifest> {
     if (this.cachedManifest) {
       logger.debug("Using cached manifest");
@@ -77,11 +77,11 @@ export abstract class BaseDownloader {
     }
     const url = `https://play.google.com/books/volumes/${this.bookId}/manifest?hl=en&source=ge-web-app`;
     logger.debug(`Fetching book manifest from: ${url}`);
-    const res = await fetch(url, { headers: this.headers });
-    if (!res.ok) {
-      throw new Error(`Failed to fetch book manifest: ${res.statusText} (${res.status})`);
+    const response = await fetchWithRetry(url, { headers: this.headers });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch book manifest: ${response.statusText} (${response.status})`);
     }
-    const json = await res.json() as GoogleBookManifest;
+    const json = await response.json() as GoogleBookManifest;
     this.cachedManifest = json;
     logger.debug(`Manifest metadata: title="${json.metadata?.title}", segments=${json.segment?.length || 0}, pages=${json.page?.length || 0}`);
     return json;
@@ -119,25 +119,54 @@ export abstract class BaseDownloader {
     return key;
   }
 
-  /**
-   * Log messages.
-   */
-  log(message: string) {
+  log(message: string): void {
     logger.info(message);
   }
 
-  /**
-   * Log warnings.
-   */
-  logWarn(message: string) {
+  logWarn(message: string): void {
     logger.warn(message);
   }
 
-  /**
-   * Log errors.
-   */
-  logError(message: string) {
+  logError(message: string): void {
     logger.error(message);
+  }
+
+  /**
+   * Sets the book-specific output subdirectory and creates it.
+   */
+  public prepareOutputDir(safeTitle: string): void {
+    const subdir = path.join(this.options.outputDir, safeName(safeTitle));
+    if (!fs.existsSync(subdir)) {
+      fs.mkdirSync(subdir, { recursive: true });
+    }
+    this.bookOutputDir = subdir;
+  }
+
+  /**
+   * Saves book metadata as a JSON file alongside the output.
+   */
+  public saveMetadata(metadata: GoogleBookMetadata, title: string): void {
+    const jsonPath = path.join(this.bookOutputDir, `${safeName(title)}_metadata.json`);
+    const jsonData = JSON.stringify(metadata, null, 2);
+    fs.writeFileSync(jsonPath, jsonData, "utf-8");
+    logger.info(`Metadata saved to: ${jsonPath}`);
+  }
+
+  /**
+   * Cleans up temporary files for this book.
+   */
+  protected cleanup(): void {
+    try {
+      logger.info("Cleaning up temporary files...");
+      if (fs.existsSync(this.bookTempDir)) {
+        fs.rmSync(this.bookTempDir, { recursive: true, force: true });
+      }
+      if (fs.existsSync(this.options.tempDir) && fs.readdirSync(this.options.tempDir).length === 0) {
+        fs.rmSync(this.options.tempDir, { recursive: true, force: true });
+      }
+    } catch {
+      // Ignore cleanup error
+    }
   }
 
   /**

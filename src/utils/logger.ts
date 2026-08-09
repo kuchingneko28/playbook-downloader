@@ -1,34 +1,42 @@
-import chalk from "chalk";
+import * as clack from "@clack/prompts";
 
-/**
- * Professional CLI logger with chalk coloring.
- */
+export const { intro, outro } = clack;
+
+export async function withSpinner<T>(label: string, task: () => Promise<T>): Promise<T> {
+  const spinner = clack.spinner();
+  spinner.start(label);
+  try {
+    const result = await task();
+    spinner.stop(label);
+    return result;
+  } catch (error) {
+    spinner.stop(`${label} failed`);
+    throw error;
+  }
+}
+
 export const logger = {
   showDebug: false,
-  timestamp: () =>
-    chalk.gray(`${new Date().toLocaleTimeString([], { hour12: false })}`),
 
-  info: (msg: string) => console.log(chalk.cyan.bold("ℹ ") + msg),
-  success: (msg: string) => console.log(chalk.green.bold("✔ ") + msg),
-  warn: (msg: string) => console.log(chalk.yellow.bold("⚠ ") + msg),
-  error: (msg: string) => console.log(chalk.red.bold("✖ ") + msg),
-  debug: (msg: string) => {
+  info: (messageText: string): void => { clack.log.info(messageText); },
+  success: (messageText: string): void => { clack.log.success(messageText); },
+  warn: (messageText: string): void => { clack.log.warn(messageText); },
+  error: (messageText: string): void => { clack.log.error(messageText); },
+  step: (messageText: string): void => { clack.log.step(messageText); },
+  debug: (messageText: string): void => {
     if (logger.showDebug) {
-      console.log(
-        `${logger.timestamp()} ${chalk.magenta.bold("DEBUG")} ${msg}`,
-      );
+      clack.log.message(`[DEBUG] ${messageText}`);
     }
   },
-  step: (msg: string) => console.log(chalk.magenta.bold("➔ ") + msg),
-  progress: (current: number, total: number, prefix: string) => {
+  progress: (current: number, total: number, prefix: string): void => {
     if (logger.showDebug) {
       logger.info(`[${current}/${total}] ${prefix}`);
     } else {
-      const pct = Math.round((current / total) * 100);
-      process.stdout.write(`\r\x1b[K${chalk.cyan.bold("ℹ")} ${prefix}: ${current}/${total} (${pct}%)`);
+      const percentage = Math.round((current / total) * 100);
+      process.stdout.write(`\r\x1b[K  ${prefix}: ${current}/${total} (${percentage}%)`);
     }
   },
-  clearProgress: () => {
+  clearProgress: (): void => {
     if (!logger.showDebug) {
       process.stdout.write("\n");
     }

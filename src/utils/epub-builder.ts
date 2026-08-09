@@ -30,14 +30,14 @@ export interface EpubImage {
 
 function escapeXml(unsafe: unknown): string {
   if (unsafe === undefined || unsafe === null) return "";
-  return String(unsafe).replace(/[<>&'"]/g, (c) => {
-    switch (c) {
+  return String(unsafe).replace(/[<>&'"]/g, (char) => {
+    switch (char) {
       case '<': return '&lt;';
       case '>': return '&gt;';
       case '&': return '&amp;';
       case '\'': return '&apos;';
       case '"': return '&quot;';
-      default: return c;
+      default: return char;
     }
   });
 }
@@ -119,7 +119,7 @@ export function buildEpub(
       <h1>Table of Contents</h1>
       <ol>
         ${chapters
-          .map((ch) => `<li><a href="${ch.label}.xhtml">${escapeXml(ch.title)}</a></li>`)
+          .map((chapter) => `<li><a href="${chapter.label}.xhtml">${escapeXml(chapter.title)}</a></li>`)
           .join("\n        ")}
       </ol>
     </nav>
@@ -142,12 +142,12 @@ export function buildEpub(
   <navMap>
     ${chapters
       .map(
-        (ch, i) => `
-    <navPoint id="navPoint-${i + 1}" playOrder="${i + 1}">
+        (chapter, index) => `
+    <navPoint id="navPoint-${index + 1}" playOrder="${index + 1}">
       <navLabel>
-        <text>${escapeXml(ch.title)}</text>
+        <text>${escapeXml(chapter.title)}</text>
       </navLabel>
-      <content src="${ch.label}.xhtml"/>
+      <content src="${chapter.label}.xhtml"/>
     </navPoint>`
       )
       .join("")}
@@ -188,35 +188,35 @@ export function buildEpub(
     
     ${chapters
       .map(
-        (ch) => `
-    <item id="xhtml-${ch.label}" href="${ch.label}.xhtml" media-type="application/xhtml+xml"/>
-    <item id="css-${ch.label}" href="${ch.label}.css" media-type="text/css"/>`
+        (chapter) => `
+    <item id="xhtml-${chapter.label}" href="${chapter.label}.xhtml" media-type="application/xhtml+xml"/>
+    <item id="css-${chapter.label}" href="${chapter.label}.css" media-type="text/css"/>`
       )
       .join("")}
 
     ${images
       .map(
-        (img, idx) =>
-          `<item id="epub-img-${idx}" href="${img.filename}" media-type="${img.mimeType}"/>`
+        (image, index) =>
+          `<item id="epub-img-${index}" href="${image.filename}" media-type="${image.mimeType}"/>`
       )
       .join("\n    ")}
   </manifest>
   <spine toc="ncx">
     ${cover ? '<itemref idref="cover-xhtml"/>' : ""}
-    ${chapters.map((ch) => `<itemref idref="xhtml-${ch.label}"/>`).join("\n    ")}
+    ${chapters.map((chapter) => `<itemref idref="xhtml-${chapter.label}"/>`).join("\n    ")}
   </spine>
 </package>`;
     archive.append(contentOpf, { name: "OEBPS/content.opf" });
 
-    // 7. Add chapters (XHTML and CSS files)
-    for (const ch of chapters) {
-      archive.append(ch.xhtml, { name: `OEBPS/${ch.label}.xhtml` });
-      archive.append(ch.css, { name: `OEBPS/${ch.label}.css` });
+    // Add chapters (XHTML and CSS files)
+    for (const chapter of chapters) {
+      archive.append(chapter.xhtml, { name: `OEBPS/${chapter.label}.xhtml` });
+      archive.append(chapter.css, { name: `OEBPS/${chapter.label}.css` });
     }
 
-    // 8. Add inline images
-    for (const img of images) {
-      archive.append(img.data, { name: `OEBPS/${img.filename}` });
+    // Add inline images
+    for (const image of images) {
+      archive.append(image.data, { name: `OEBPS/${image.filename}` });
     }
 
     archive.finalize();

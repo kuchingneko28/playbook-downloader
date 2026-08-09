@@ -3,9 +3,10 @@ import path from "path";
 import { PDFDocument } from "pdf-lib";
 import { BaseDownloader, DownloaderOptions } from "./base";
 import { decryptPage } from "../utils/crypto";
-import { logger } from "../utils/logger";
+import { logger, withSpinner } from "../utils/logger";
 import { GoogleBookMetadata, GoogleBookPageManifest, GoogleBookTocEntry } from "../types";
-import { safeName, unescapeHtml, delay } from "../utils/helpers";
+import { safeName, unescapeHtml } from "../utils/text";
+import { delay, fetchWithRetry, concurrentMap } from "../utils/async";
 
 export class PdfDownloader extends BaseDownloader {
   private cachedFiles: Set<string> = new Set();
@@ -44,20 +45,40 @@ export class PdfDownloader extends BaseDownloader {
       return path.join(this.bookTempDir, existingFile);
     }
 
-    // Set Accept header to prioritize JPEG/PNG so we don't get WebP (which pdf-lib doesn't support)
-    const headers = {
-      ...this.headers,
-      accept: "image/png,image/jpeg,image/*;q=0.8",
+    // Try fetching with preferred formats, falling back if WebP is returned
+    let lastError: Error | null = null;
+    const tryFetch = async (accept: string): Promise<{ response: Response; extension: string } | null> => {
+      const headers = { ...this.headers, accept };
+      const response = await fetchWithRetry(url.toString(), { headers });
+      if (!response.ok) {
+        lastError = new Error(`HTTP ${response.status} ${response.statusText}`);
+        return null;
+      }
+      const contentType = response.headers.get("content-type") || "image/jpeg";
+      if (contentType.includes("webp")) return null;
+      const extension = contentType.includes("png") ? "png" : "jpeg";
+      return { response, extension };
     };
 
-    const response = await fetch(url.toString(), { headers });
-    if (!response.ok) {
-      throw new Error(`Failed to download page: ${response.statusText} (${response.status})`);
+    const acceptPrefs = [
+      "image/png,image/jpeg,image/*;q=0.8",
+      "image/png,image/jpeg;q=0.9,*/*;q=0.1",
+      "image/png",
+    ];
+
+    let result: { response: Response; extension: string } | null = null;
+    for (const accept of acceptPrefs) {
+      result = await tryFetch(accept);
+      if (result || lastError) break;
     }
 
-    const contentType = response.headers.get("content-type") || "image/jpeg";
-    const ext = contentType.includes("png") ? "png" : "jpeg";
-    const filename = `${pid}.${ext}`;
+    if (!result) {
+      const detail = lastError ? (lastError as Error).message : "unacceptable image format returned";
+      throw new Error(`Failed to download page ${pid}: ${detail}`);
+    }
+
+    const { response, extension } = result;
+    const filename = `${pid}.${extension}`;
     const filepath = path.join(this.bookTempDir, filename);
 
     const arrayBuffer = await response.arrayBuffer();
@@ -125,7 +146,7 @@ export class PdfDownloader extends BaseDownloader {
     const pdfBytes = await pdfDoc.save();
     const safeTitle = safeName(title);
     const pdfFilename = `${safeTitle}.pdf`;
-    const outputPath = path.join(this.options.outputDir, pdfFilename);
+    const outputPath = path.join(this.bookOutputDir, pdfFilename);
 
     fs.writeFileSync(outputPath, pdfBytes);
     return outputPath;
@@ -154,16 +175,16 @@ export class PdfDownloader extends BaseDownloader {
   /**
    * Generates and saves a human-readable table of contents text file.
    */
-  private saveToc(toc: GoogleBookTocEntry[], title: string): void {
+  public saveToc(toc: GoogleBookTocEntry[], title: string): void {
     const formattedToc = toc
-      .map((t) => {
-        const indent = "  ".repeat(t.depth || 0);
-        const label = unescapeHtml(t.label);
-        return `${indent}${label}`.padEnd(60, ".") + ` p.${(t.page_index || 0) + 1}`;
+      .map((entry) => {
+        const indent = "  ".repeat(entry.depth || 0);
+        const label = unescapeHtml(entry.label);
+        return `${indent}${label}`.padEnd(60, ".") + ` p.${(entry.page_index || 0) + 1}`;
       })
       .join("\n");
 
-    const tocPath = path.join(this.options.outputDir, `${safeName(title)}_TOC.txt`);
+    const tocPath = path.join(this.bookOutputDir, `${safeName(title)}_TOC.txt`);
     fs.writeFileSync(tocPath, formattedToc);
     logger.info(`Table of contents saved to: ${tocPath}`);
   }
@@ -172,11 +193,13 @@ export class PdfDownloader extends BaseDownloader {
    * Core download runner for PDF.
    */
   async run(): Promise<void> {
-    logger.info("Fetching book details...");
-    const html = await this.getBookHtml();
+    const { html, manifest } = await withSpinner("Fetching book details...", async () => {
+      const htmlText = await this.getBookHtml();
+      const manifestData = await this.getManifest();
+      return { html: htmlText, manifest: manifestData };
+    });
     const aesKey = this.getKey(html);
-    const manifest = await this.getManifest();
-    const metadata = manifest.metadata;
+    const metadata = manifest.metadata || {};
     const toc = this.getToc(html);
 
     if (!manifest.page || manifest.page.length === 0) {
@@ -184,14 +207,14 @@ export class PdfDownloader extends BaseDownloader {
     }
 
     if (metadata.preview && metadata.preview !== "full") {
-      throw new Error(`The book is in preview mode ('${metadata.preview}'). Please refresh or update your cookies in cookies.txt to download the full book.`);
+      logger.warn(`The book metadata indicates preview mode ('${metadata.preview}'). Downloading available pages...`);
     }
 
-    const missingPages = manifest.page.filter((p) => !p.src);
+    const missingPages = manifest.page.filter((page) => !page.src);
     if (missingPages.length > 0) {
       const pct = ((missingPages.length / manifest.page.length) * 100).toFixed(2);
       const listStr = logger.showDebug
-        ? ` List of missing pages: [${missingPages.map((p) => p.pid).join(", ")}].`
+        ? ` List of missing pages: [${missingPages.map((page) => page.pid).join(", ")}].`
         : "";
       logger.warn(`Could not find a download link for ${missingPages.length} pages (${pct}% missing, total: ${manifest.page.length}).${listStr} You might need to update your cookies.`);
     }
@@ -202,7 +225,9 @@ export class PdfDownloader extends BaseDownloader {
     const title = metadata.title || metadata.volume_title || "Untitled";
     const safeTitle = safeName(title);
     const pdfFilename = `${safeTitle}.pdf`;
-    const outputPath = path.join(this.options.outputDir, pdfFilename);
+
+    this.prepareOutputDir(safeTitle);
+    const outputPath = path.join(this.bookOutputDir, pdfFilename);
 
     if (fs.existsSync(outputPath)) {
       logger.success(`Book already exists in downloads: ${outputPath}`);
@@ -221,40 +246,42 @@ export class PdfDownloader extends BaseDownloader {
     logger.info(`Total Pages : ${num_pages}`);
     logger.info(`Publisher   : ${publisher}`);
 
-    // Handle RTL pages layout if specified in manifest
+    let validPages = pages.filter((page) => page.src);
+    if (validPages.length === 0) {
+      throw new Error("No accessible pages with download links found. Please check your account ownership and cookies.");
+    }
+
     if (manifest.is_right_to_left) {
       logger.warn("Book is marked as right-to-left (RTL). Adjusting page pairs order.");
-      pages = this.adjustRtlPages(pages);
+      validPages = this.adjustRtlPages(validPages);
     }
 
-    logger.step(`Downloading ${pages.length} pages...`);
+    logger.step(`Downloading ${validPages.length} pages...`);
+    const concurrency = this.options.concurrency || 1;
 
-    const imagePaths: string[] = [];
+    let completedCount = 0;
+    const imagePaths: string[] = await concurrentMap(
+      validPages,
+      concurrency,
+      async (page) => {
+        const { pid, src, order } = page;
+        const imagePath = await this.downloadAndDecryptPage(
+          src!,
+          aesKey,
+          pid,
+          order,
+          validPages.length,
+        );
+        completedCount++;
+        logger.progress(completedCount, validPages.length, `Saved page ${pid}`);
 
-    for (let i = 0; i < pages.length; i++) {
-      const page = pages[i];
-      const { pid, src, order } = page;
-      if (!src) {
-        if (!logger.showDebug) process.stdout.write("\n");
-        logger.info(`[${i + 1}/${pages.length}] Skipped page ${pid} (missing link)`);
-        continue;
-      }
+        if (concurrency <= 1 && this.options.pace > 0 && completedCount < validPages.length) {
+          await delay(this.options.pace);
+        }
 
-      const imagePath = await this.downloadAndDecryptPage(
-        src,
-        aesKey,
-        pid,
-        order,
-        pages.length
-      );
-      imagePaths.push(imagePath);
-      
-      logger.progress(i + 1, pages.length, `Saved page ${pid}`);
-
-      if (this.options.pace > 0 && i < pages.length - 1) {
-        await delay(this.options.pace);
-      }
-    }
+        return imagePath;
+      },
+    );
     logger.clearProgress();
 
     const pdfPath = await this.createPdf(imagePaths, metadata);
@@ -265,17 +292,7 @@ export class PdfDownloader extends BaseDownloader {
       this.saveToc(toc, title);
     }
 
-    // Cleanup temporary directory
-    try {
-      logger.info("Cleaning up temporary files...");
-      if (fs.existsSync(this.bookTempDir)) {
-        fs.rmSync(this.bookTempDir, { recursive: true, force: true });
-      }
-      if (fs.existsSync(this.options.tempDir) && fs.readdirSync(this.options.tempDir).length === 0) {
-        fs.rmSync(this.options.tempDir, { recursive: true, force: true });
-      }
-    } catch (err) {
-      // Ignore cleanup error
-    }
+    this.saveMetadata(metadata, title);
+    this.cleanup();
   }
 }

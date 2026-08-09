@@ -10,11 +10,15 @@
     "start": "bun run src/cli.ts",
     "test": "bun test"
   },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "Download Google Play Books as PDF or EPUB using Bun and TypeScript",
   "dependencies": {
+    "@clack/prompts": "^1.7.0",
     "archiver": "^6.0.1",
     "cac": "^6.7.14",
     "chalk": "^4.1.2",

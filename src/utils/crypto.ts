@@ -5,7 +5,7 @@ import crypto from "crypto";
  */
 export function decipherKey(str: string): Buffer {
   const groups = str.match(/\D+\d/g) || [];
-  let bits = groups.map((s) => (s[parseInt(s.slice(-1))] === s.slice(-2, -1) ? "1" : "0"));
+  let bits = groups.map((group) => (group[parseInt(group.slice(-1))] === group.slice(-2, -1) ? "1" : "0"));
   
   if (bits.length === 0) {
     throw new Error("Failed to decipher key: no bit groups matched. The HTML format might have changed.");

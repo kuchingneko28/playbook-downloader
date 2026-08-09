@@ -22,14 +22,14 @@ export function getCookieHeader(cookiePath: string): string {
       const name = parts[5]?.trim();
       const value = parts[6]?.trim();
 
-      // Only allow standard printable ASCII characters for security
-      if (!name || !value || !/^[\x20-\x7E]+$/.test(name) || !/^[\x20-\x7E]+$/.test(value)) {
+      // Only allow standard printable ASCII characters except semicolon for security
+      if (!name || !value || !/^[\x20-\x3A\x3C-\x7E]+$/.test(name) || !/^[\x20-\x3A\x3C-\x7E]+$/.test(value)) {
         return null;
       }
 
       return `${name}=${value}`;
     })
-    .filter((c): c is string => c !== null);
+    .filter((cookie): cookie is string => cookie !== null);
 
   if (cookies.length === 0) {
     throw new Error(`No valid cookies found in ${cookiePath}. Please verify the file format.`);
